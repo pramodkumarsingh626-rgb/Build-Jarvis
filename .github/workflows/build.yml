@@ -1,0 +1,579 @@
+name: Build Jarvis
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Accept Android licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.5"
+      - name: Write Jarvis project files
+        run: |
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'JARVIS_EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.jarvis.assistant"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.jarvis.assistant"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.core:core-ktx:1.12.0") }
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'JARVIS_EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.READ_CALL_LOG" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.SEND_SMS" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+              <queries><intent><action android:name="android.speech.RecognitionService" /></intent></queries>
+              <application android:label="Jarvis" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".JarvisService" android:exported="false" android:foregroundServiceType="microphone" />
+                  <service android:name=".JarvisAccess" android:exported="true" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/access_config" />
+                  </service>
+              </application>
+          </manifest>
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/java/com/jarvis/assistant/JarvisAccess.kt)"
+          cat > app/src/main/java/com/jarvis/assistant/JarvisAccess.kt <<'JARVIS_EOF'
+          package com.jarvis.assistant
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class JarvisAccess : AccessibilityService() {
+              companion object { @Volatile var inst: JarvisAccess? = null }
+              override fun onServiceConnected() { inst = this }
+              override fun onUnbind(i: Intent?): Boolean { inst = null; return super.onUnbind(i) }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun clickText(t: String): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  for (n in root.findAccessibilityNodeInfosByText(t)) {
+                      var x: AccessibilityNodeInfo? = n
+                      while (x != null) {
+                          if (x.isClickable) return x.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                          x = x.parent
+                      }
+                  }
+                  return false
+              }
+
+              fun typeText(t: String): Boolean {
+                  val f = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                  val b = Bundle()
+                  b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, t)
+                  return f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b)
+              }
+
+              fun swipe(up: Boolean) {
+                  val dm = resources.displayMetrics
+                  val w = dm.widthPixels / 2f
+                  val h = dm.heightPixels.toFloat()
+                  val p = Path()
+                  if (up) { p.moveTo(w, h * 0.75f); p.lineTo(w, h * 0.25f) } else { p.moveTo(w, h * 0.25f); p.lineTo(w, h * 0.75f) }
+                  dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, 300)).build(), null, null)
+              }
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/java/com/jarvis/assistant/JarvisService.kt)"
+          cat > app/src/main/java/com/jarvis/assistant/JarvisService.kt <<'JARVIS_EOF'
+          package com.jarvis.assistant
+
+          import android.Manifest
+          import android.accessibilityservice.AccessibilityService
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.AlarmClock
+          import android.provider.ContactsContract
+          import android.provider.Settings
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.telecom.TelecomManager
+          import android.telephony.SmsManager
+          import android.telephony.TelephonyManager
+          import android.view.KeyEvent
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class JarvisService : Service(), TextToSpeech.OnInitListener {
+              companion object {
+                  @Volatile var running = false
+                  var onLog: ((String) -> Unit)? = null
+              }
+
+              private val h = Handler(Looper.getMainLooper())
+              private var sr: SpeechRecognizer? = null
+              private lateinit var tts: TextToSpeech
+              private lateinit var am: AudioManager
+              private var speaking = false
+              private var awake = 0L
+              private var torch = false
+              private val wake = Regex("jarvis|jervis|travis|darvis|garvis")
+
+              private val phoneRx = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      if (i.getStringExtra(TelephonyManager.EXTRA_STATE) == TelephonyManager.EXTRA_STATE_RINGING) {
+                          @Suppress("DEPRECATION") val n = i.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)
+                          awake = System.currentTimeMillis() + 30000
+                          say("Incoming call from " + (n?.let { nameOf(it) } ?: "an unknown number") + ". Say answer or reject.")
+                      }
+                  }
+              }
+
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onStartCommand(i: Intent?, f: Int, id: Int) = START_STICKY
+
+              override fun onCreate() {
+                  super.onCreate()
+                  running = true
+                  am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  val ch = "jarvis"
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(ch, "Jarvis", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, ch).setContentTitle("J.A.R.V.I.S online").setContentText("Listening for commands")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now).build()
+                  if (Build.VERSION.SDK_INT >= 30) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) else startForeground(1, n)
+                  registerReceiver(phoneRx, IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED))
+                  tts = TextToSpeech(this, this)
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  h.removeCallbacksAndMessages(null)
+                  try { unregisterReceiver(phoneRx) } catch (e: Exception) {}
+                  sr?.destroy(); tts.shutdown()
+                  super.onDestroy()
+              }
+
+              private fun log(m: String) { onLog?.invoke(m) }
+
+              override fun onInit(st: Int) {
+                  if (st != TextToSpeech.SUCCESS) { listen(); return }
+                  tts.language = Locale.UK
+                  tts.voices?.firstOrNull { it.locale.language == "en" && it.name.contains("male", true) && !it.name.contains("female", true) }?.let { tts.voice = it }
+                  tts.setPitch(0.3f); tts.setSpeechRate(0.85f)
+                  tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) {}
+                      override fun onDone(id: String?) { h.post { speaking = false; listen() } }
+                      @Deprecated("x") override fun onError(id: String?) { h.post { speaking = false; listen() } }
+                  })
+                  say("Jarvis online. At your service, sir.")
+              }
+
+              private fun say(t: String) {
+                  log("JARVIS: $t"); speaking = true; sr?.cancel()
+                  tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "u" + System.nanoTime())
+              }
+
+              private fun listen() {
+                  if (!running || speaking) return
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) { log("Speech recognition unavailable"); return }
+                  sr?.destroy()
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  sr = r
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onResults(b: Bundle?) {
+                          b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { handle(it) }
+                          h.postDelayed({ listen() }, 300)
+                      }
+                      override fun onError(e: Int) { h.postDelayed({ listen() }, if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1500 else 400) }
+                      override fun onReadyForSpeech(p: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(v: Float) {}
+                      override fun onBufferReceived(b: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(b: Bundle?) {}
+                      override fun onEvent(t: Int, b: Bundle?) {}
+                  })
+                  r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US"))
+              }
+
+              private fun handle(raw: String) {
+                  val now = System.currentTimeMillis()
+                  var q = raw.lowercase(Locale.ROOT).trim()
+                  val m = wake.find(q)
+                  if (m != null) { q = q.substring(m.range.last + 1).trim().trimStart(',', '.', ' '); awake = now + 25000 }
+                  else if (now > awake) return
+                  else awake = now + 25000
+                  log("YOU: $raw")
+                  if (q.isEmpty()) { say("Yes sir?"); return }
+                  runCmd(q)
+              }
+
+              private fun has(p: PackageManager, perm: String) = checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
+
+              private fun nameOf(num: String): String? {
+                  if (!has(packageManager, Manifest.permission.READ_CONTACTS)) return null
+                  val u = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(num))
+                  contentResolver.query(u, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) return it.getString(0) }
+                  return null
+              }
+
+              private fun findNumber(name: String): String? {
+                  if (!has(packageManager, Manifest.permission.READ_CONTACTS)) return null
+                  val c = contentResolver.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER), null, null, null) ?: return null
+                  c.use {
+                      var best: String? = null
+                      while (it.moveToNext()) {
+                          val n = (it.getString(0) ?: "").lowercase()
+                          if (n == name) return it.getString(1)
+                          if (best == null && n.isNotEmpty() && (n.contains(name) || name.contains(n))) best = it.getString(1)
+                      }
+                      return best
+                  }
+              }
+
+              private fun findApp(name: String): String? {
+                  val pm = packageManager
+                  val list = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val n = name.lowercase().trim()
+                  fun lab(i: android.content.pm.ResolveInfo) = i.loadLabel(pm).toString().lowercase()
+                  val hit = list.firstOrNull { lab(it) == n } ?: list.firstOrNull { lab(it).contains(n) }
+                      ?: list.firstOrNull { lab(it).length > 2 && n.contains(lab(it)) }
+                  return hit?.activityInfo?.packageName
+              }
+
+              private fun runCmd(q: String) {
+                  fun has(vararg w: String) = w.any { q.contains(it) }
+                  fun rx(p: String) = Regex(p).find(q)
+                  fun later(f: () -> Unit) { h.postDelayed({ try { f() } catch (e: Exception) { log("ERR " + e.message) } }, 1200) }
+                  fun go(i: Intent) { later { startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
+                  val a = JarvisAccess.inst
+                  fun acc(ok: String, f: JarvisAccess.() -> Unit) { if (a == null) say("Please enable my accessibility service, sir.") else { say(ok); later { a.f() } } }
+                  val tc = getSystemService(TelecomManager::class.java)
+                  try {
+                      when {
+                          has("stop listening", "shut down", "go offline", "goodbye") -> { say("Going offline. Goodbye sir."); h.postDelayed({ stopSelf() }, 3500) }
+                          rx("^(answer|pick up|accept)") != null -> { say("Answering"); tc.acceptRingingCall(); if (has("speaker")) h.postDelayed({ am.isSpeakerphoneOn = true }, 1500) }
+                          rx("^(reject|decline|hang up|end call|end the call|cut the call|disconnect)") != null -> { say("Ending the call"); tc.endCall() }
+                          has("speaker") -> { am.isSpeakerphoneOn = !has("off"); say("Speaker " + (if (has("off")) "off" else "on")) }
+                          rx("^(?:call|dial|ring|phone)\\s+(.+)") != null -> {
+                              val t = rx("^(?:call|dial|ring|phone)\\s+(.+)")!!.groupValues[1].trim()
+                              val num = if (t.count { it.isDigit() } >= 3) t.filter { it.isDigit() || it == '+' } else findNumber(t)
+                              if (num == null) say("I could not find $t in your contacts, sir.")
+                              else if (!has(packageManager, Manifest.permission.CALL_PHONE)) say("I need the phone permission, sir.")
+                              else { say("Calling $t"); go(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(num)))) }
+                          }
+                          has("dialer", "keypad") -> { say("Opening the dialer"); go(Intent(Intent.ACTION_DIAL)) }
+                          rx("^(?:text|sms|message)\\s+(.+?)\\s+(?:saying|say|that)\\s+(.+)") != null -> {
+                              val g = rx("^(?:text|sms|message)\\s+(.+?)\\s+(?:saying|say|that)\\s+(.+)")!!.groupValues
+                              val num = if (g[1].count { it.isDigit() } >= 3) g[1].filter { it.isDigit() || it == '+' } else findNumber(g[1].trim())
+                              if (num == null) say("I could not find ${g[1]}, sir.") else {
+                                  @Suppress("DEPRECATION") val sm = if (Build.VERSION.SDK_INT >= 31) getSystemService(SmsManager::class.java) else SmsManager.getDefault()
+                                  sm.sendMultipartTextMessage(num, null, sm.divideMessage(g[2]), null, null)
+                                  say("Message sent to ${g[1]}")
+                              }
+                          }
+                          rx("whatsapp\\s+(.+?)\\s+(?:saying|say|that)\\s+(.+)") != null -> {
+                              val g = rx("whatsapp\\s+(.+?)\\s+(?:saying|say|that)\\s+(.+)")!!.groupValues
+                              val num = if (g[1].count { it.isDigit() } >= 3) g[1].filter { it.isDigit() } else findNumber(g[1].trim())?.filter { it.isDigit() }
+                              if (num == null) say("I could not find ${g[1]}, sir.") else {
+                                  say("Sending a WhatsApp message to ${g[1]}")
+                                  go(Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/$num?text=" + Uri.encode(g[2]))))
+                                  h.postDelayed({ JarvisAccess.inst?.clickText("Send") }, 6000)
+                              }
+                          }
+                          has("what time", "the time") -> say("It is " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date()))
+                          has("what date", "today's date", "what day") -> say("Today is " + SimpleDateFormat("EEEE, MMMM d", Locale.getDefault()).format(Date()))
+                          has("battery") -> { val b = getSystemService(BatteryManager::class.java); say("Battery is at " + b.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) + " percent") }
+                          has("flashlight", "torch", "flash light") -> {
+                              val on = !has("off")
+                              val cm = getSystemService(CameraManager::class.java)
+                              cm.setTorchMode(cm.cameraIdList[0], on); say("Flashlight " + (if (on) "on" else "off"))
+                          }
+                          has("volume") -> {
+                              val s = AudioManager.STREAM_MUSIC
+                              when {
+                                  has("max", "full") -> am.setStreamVolume(s, am.getStreamMaxVolume(s), AudioManager.FLAG_SHOW_UI)
+                                  has("mute") -> am.setStreamVolume(s, 0, AudioManager.FLAG_SHOW_UI)
+                                  has("down", "lower", "decrease", "reduce") -> am.adjustStreamVolume(s, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+                                  else -> am.adjustStreamVolume(s, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+                              }
+                              say("Done")
+                          }
+                          q in listOf("pause", "pause music", "stop music", "play music", "resume", "resume music", "play") -> { media(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE); say("Done") }
+                          has("next song", "next track") -> { media(KeyEvent.KEYCODE_MEDIA_NEXT); say("Next track") }
+                          has("previous song", "previous track") -> { media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); say("Previous track") }
+                          rx("^play\\s+(.+)") != null -> {
+                              val s = rx("^play\\s+(.+?)(?:\\s+on youtube)?$")!!.groupValues[1]
+                              say("Playing $s"); go(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(s))))
+                          }
+                          has("wifi", "wi-fi") -> { say("Opening Wi-Fi settings"); go(Intent(Settings.ACTION_WIFI_SETTINGS)) }
+                          has("bluetooth") -> { say("Opening Bluetooth settings"); go(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
+                          has("airplane", "flight mode") -> { say("Opening airplane mode settings"); go(Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS)) }
+                          has("go home", "home screen") -> acc("Going home") { performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME) }
+                          rx("^(go )?back$") != null -> acc("Going back") { performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK) }
+                          has("recent apps", "recents") -> acc("Opening recent apps") { performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS) }
+                          has("notification") -> acc("Opening notifications") { performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS) }
+                          has("quick settings") -> acc("Opening quick settings") { performGlobalAction(AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS) }
+                          has("lock") -> acc("Locking the screen") { performGlobalAction(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN) }
+                          has("screenshot", "screen shot") -> acc("Taking a screenshot") { performGlobalAction(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT) }
+                          has("power menu") -> acc("Opening the power menu") { performGlobalAction(AccessibilityService.GLOBAL_ACTION_POWER_DIALOG) }
+                          has("scroll down", "swipe up") -> acc("Scrolling down") { swipe(true) }
+                          has("scroll up", "swipe down") -> acc("Scrolling up") { swipe(false) }
+                          rx("^(?:click|tap|press|select)\\s+(?:on\\s+)?(.+)") != null -> {
+                              val t = rx("^(?:click|tap|press|select)\\s+(?:on\\s+)?(.+)")!!.groupValues[1]
+                              acc("Pressing $t") { if (!clickText(t)) h.post { say("I could not find $t on the screen") } }
+                          }
+                          rx("^(?:type|write|enter)\\s+(.+)") != null -> {
+                              val t = rx("^(?:type|write|enter)\\s+(.+)")!!.groupValues[1]
+                              acc("Typing") { if (!typeText(t)) h.post { say("Please tap a text box first, sir") } }
+                          }
+                          has("alarm") -> {
+                              val r = rx("(\\d{1,2})(?:[: ](\\d{2}))?\\s*(a\\.?m\\.?|p\\.?m\\.?)?")
+                              if (r == null) say("Which time, sir?") else {
+                                  var hr = r.groupValues[1].toInt(); val mn = r.groupValues[2].toIntOrNull() ?: 0
+                                  if (r.groupValues[3].startsWith("p") && hr < 12) hr += 12
+                                  say("Setting an alarm for $hr $mn")
+                                  go(Intent(AlarmClock.ACTION_SET_ALARM).putExtra(AlarmClock.EXTRA_HOUR, hr).putExtra(AlarmClock.EXTRA_MINUTES, mn).putExtra(AlarmClock.EXTRA_SKIP_UI, true))
+                              }
+                          }
+                          rx("^(?:navigate to|directions to|take me to)\\s+(.+)") != null -> {
+                              val d = rx("^(?:navigate to|directions to|take me to)\\s+(.+)")!!.groupValues[1]
+                              say("Navigating to $d"); go(Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=" + Uri.encode(d))))
+                          }
+                          rx("^(?:open|launch|start|run)\\s+(?:the\\s+)?(.+?)(?:\\s+app)?$") != null -> {
+                              val n = rx("^(?:open|launch|start|run)\\s+(?:the\\s+)?(.+?)(?:\\s+app)?$")!!.groupValues[1]
+                              val pkg = findApp(n)
+                              if (pkg == null) say("I could not find $n on this phone, sir.")
+                              else { say("Launching $n"); later { startActivity(packageManager.getLaunchIntentForPackage(pkg)!!.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
+                          }
+                          rx("^(?:search for|search|google|look up|who is|what is|tell me about)\\s+(.+)") != null -> {
+                              val s = rx("^(?:search for|search|google|look up|who is|what is|tell me about)\\s+(.+)")!!.groupValues[1]
+                              say("Searching for $s"); go(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(s))))
+                          }
+                          has("who are you", "your name") -> say("I am Jarvis, your personal assistant.")
+                          has("how are you") -> say("All systems are running at peak efficiency, sir.")
+                          has("joke") -> say("I would tell you a UDP joke, sir, but you might not get it.")
+                          has("hello", "hi ", "hey") || q == "hi" -> say("Hello sir. How may I help?")
+                          else -> { say("Searching the web for that."); go(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q)))) }
+                      }
+                  } catch (e: Exception) { say("I could not complete that command, sir.") }
+              }
+
+              private fun media(code: Int) {
+                  am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+                  am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+              }
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/java/com/jarvis/assistant/MainActivity.kt)"
+          cat > app/src/main/java/com/jarvis/assistant/MainActivity.kt <<'JARVIS_EOF'
+          package com.jarvis.assistant
+
+          import android.Manifest
+          import android.animation.ValueAnimator
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.animation.LinearInterpolator
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.sin
+
+          class ReactorView(c: Context) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private var t = 0f
+              var boost = false
+              init {
+                  setLayerType(LAYER_TYPE_SOFTWARE, null)
+                  ValueAnimator.ofFloat(0f, 360f).apply {
+                      duration = 6000; repeatCount = ValueAnimator.INFINITE; interpolator = LinearInterpolator()
+                      addUpdateListener { t = it.animatedValue as Float; invalidate() }; start()
+                  }
+              }
+              override fun onDraw(c: Canvas) {
+                  val cx = width / 2f; val cy = height / 2f; val r = minOf(cx, cy) * 0.92f
+                  val col = if (boost) 0xFF00E5FF.toInt() else 0xFF0A7A8C.toInt()
+                  p.color = col; p.setShadowLayer(18f, 0f, 0f, col); p.style = Paint.Style.STROKE
+                  fun ring(f: Float, w: Float, dir: Float, seg: Float, n: Int) {
+                      p.strokeWidth = w
+                      val rr = r * f
+                      val rect = RectF(cx - rr, cy - rr, cx + rr, cy + rr)
+                      c.save(); c.rotate(t * dir, cx, cy)
+                      for (i in 0 until n) c.drawArc(rect, i * 360f / n, seg, false, p)
+                      c.restore()
+                  }
+                  ring(1.0f, 3f, 0.4f, 6f, 36); ring(0.82f, 10f, 1f, 60f, 4); ring(0.62f, 6f, -1.6f, 40f, 6)
+                  p.strokeWidth = 2f; c.drawCircle(cx, cy, r * 0.42f, p)
+                  p.style = Paint.Style.FILL
+                  val k = 1f + 0.12f * sin(Math.toRadians((t * 6).toDouble())).toFloat()
+                  c.drawCircle(cx, cy, r * 0.24f * k, p)
+              }
+          }
+
+          class MainActivity : Activity() {
+              private lateinit var log: TextView
+              private lateinit var reactor: ReactorView
+              private lateinit var power: Button
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun btn(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t; setTextColor(0xFF00E5FF.toInt()); setBackgroundColor(0x2200E5FF)
+                  setOnClickListener { f() }
+                  layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) }
+              }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  window.statusBarColor = 0xFF02070D.toInt(); window.navigationBarColor = 0xFF02070D.toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFF02070D.toInt())
+                      setPadding(dp(16), dp(28), dp(16), dp(16)); gravity = Gravity.CENTER_HORIZONTAL
+                  }
+                  root.addView(TextView(this).apply { text = "J.A.R.V.I.S"; textSize = 22f; letterSpacing = 0.4f; setTextColor(0xFF00E5FF.toInt()); gravity = Gravity.CENTER })
+                  reactor = ReactorView(this)
+                  root.addView(reactor, LinearLayout.LayoutParams(dp(240), dp(240)))
+                  log = TextView(this).apply { setTextColor(0xFFBFF7FF.toInt()); textSize = 13f; text = "Say \"Jarvis\" followed by a command.\n" }
+                  root.addView(ScrollView(this).apply { addView(log) }, LinearLayout.LayoutParams(-1, 0, 1f))
+                  root.addView(btn("1. GRANT PERMISSIONS") {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CALL_PHONE, Manifest.permission.ANSWER_PHONE_CALLS,
+                          Manifest.permission.READ_CONTACTS, Manifest.permission.SEND_SMS, Manifest.permission.READ_PHONE_STATE,
+                          Manifest.permission.READ_CALL_LOG, Manifest.permission.CAMERA, "android.permission.POST_NOTIFICATIONS"), 1)
+                  })
+                  root.addView(btn("2. ALLOW DISPLAY OVER OTHER APPS") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  })
+                  root.addView(btn("3. ENABLE ACCESSIBILITY CONTROL") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
+                  power = btn("ACTIVATE JARVIS") {
+                      if (JarvisService.running) {
+                          stopService(Intent(this, JarvisService::class.java)); JarvisService.running = false
+                      } else if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          Toast.makeText(this, "Grant permissions first", Toast.LENGTH_LONG).show()
+                      } else startForegroundService(Intent(this, JarvisService::class.java))
+                      Handler(Looper.getMainLooper()).postDelayed({ refresh() }, 700)
+                  }
+                  root.addView(power)
+                  setContentView(root)
+              }
+
+              private fun refresh() {
+                  reactor.boost = JarvisService.running
+                  power.text = if (JarvisService.running) "DEACTIVATE JARVIS" else "ACTIVATE JARVIS"
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  JarvisService.onLog = { m -> runOnUiThread { log.append(m + "\n") } }
+                  refresh()
+              }
+              override fun onDestroy() { JarvisService.onLog = null; super.onDestroy() }
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/res/values/strings.xml)"
+          cat > app/src/main/res/values/strings.xml <<'JARVIS_EOF'
+          <resources>
+              <string name="app_name">Jarvis</string>
+              <string name="access_desc">Lets Jarvis tap, scroll, type and navigate your phone by voice command.</string>
+          </resources>
+          JARVIS_EOF
+          mkdir -p "$(dirname app/src/main/res/xml/access_config.xml)"
+          cat > app/src/main/res/xml/access_config.xml <<'JARVIS_EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:description="@string/access_desc"
+              android:notificationTimeout="100" />
+          JARVIS_EOF
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          JARVIS_EOF
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'JARVIS_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          JARVIS_EOF
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'JARVIS_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Jarvis"
+          include(":app")
+          JARVIS_EOF
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
